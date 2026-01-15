@@ -1,0 +1,353 @@
+/**
+ * 💰 MOTOR DE CONCILIACIÓN FINANCIERA V17 (FUZZY LOGIC)
+ * =====================================================
+ * Compara reportes de Ventas (CRM/HubSpot) vs Facturación (ERP)
+ * utilizando algoritmos de similitud de texto para cruzar clientes
+ * con nombres diferentes (ej: "Coca-Cola" vs "Embotelladora S.A.")
+ */
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('💰 Conciliación')
+    .addItem('▶️ Ejecutar Reporte PLANNING PRO', 'conciliarVentasV17')
+    .addToUi();
+}
+
+function conciliarVentasV17() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Hojas de Origen
+  const hojaHubspot = ss.getSheetByName("HubSpot");
+  const hojaFactura = ss.getSheetByName("Facturacion");
+  
+  // 1. GESTIÓN DE HOJAS DE SALIDA
+  let hojaReporte = ss.getSheetByName("Reporte_Conciliacion");
+  if (!hojaReporte) { hojaReporte = ss.insertSheet("Reporte_Conciliacion"); } 
+  else { hojaReporte.clear(); }
+  hojaReporte.setHiddenGridlines(true);
+
+  let hojaAlias = ss.getSheetByName("Alias");
+  if (!hojaAlias) { 
+    hojaAlias = ss.insertSheet("Alias");
+    hojaAlias.appendRow(["Nombre HubSpot", "Nombre Facturación"]);
+    hojaAlias.getRange("A1:B1").setFontWeight("bold").setBackground("#fff2cc");
+  }
+
+  // 2. CARGAR DATOS EN MEMORIA
+  const datosHubspot = hojaHubspot.getDataRange().getValues();
+  const headersHub = datosHubspot[0];
+  const filasHubspot = datosHubspot.slice(1);
+  const datosFactura = hojaFactura.getRange(2, 1, hojaFactura.getLastRow() - 1, 2).getValues();
+  const datosAlias = hojaAlias.getDataRange().getValues().slice(1); 
+
+  // Cargar Alias Manuales
+  let mapaAlias = {};
+  datosAlias.forEach(fila => {
+    if(fila[0] && fila[1]) mapaAlias[limpiarNombreAvanzado(fila[0])] = limpiarNombreAvanzado(fila[1]);
+  });
+
+  // MAPEO COLUMNAS DINÁMICO
+  const colNombreNegocio = headersHub.indexOf("Nombre del negocio");
+  const colFechaCierre = headersHub.indexOf("Fecha de cierre");
+  const colMonto = headersHub.indexOf("Valor en la divisa de la empresa");
+  const colRazonSocial = headersHub.indexOf("Razón social");
+  const colAssociatedComp = headersHub.indexOf("Associated Company");
+  const colPropietario = headersHub.indexOf("Propietario del negocio");
+  const colPipeline = headersHub.indexOf("Pipeline");
+  const colFechaServicio = headersHub.indexOf("Fecha del servicio");
+
+  if (colMonto === -1) { Browser.msgBox("❌ Error: Columna de Monto no encontrada"); return; }
+
+  // 3. INDEXAR FACTURAS (Hash Map por Monto)
+  // Estrategia: Agrupar facturas por monto para reducir el espacio de búsqueda
+  let bolsaFacturas = {}; 
+  datosFactura.forEach((fila, index) => {
+    let nombre = fila[0];
+    let montoNum = parseFloat(fila[1]);
+    let montoKey = (montoNum || 0).toFixed(2);
+    if (!bolsaFacturas[montoKey]) bolsaFacturas[montoKey] = [];
+    bolsaFacturas[montoKey].push({
+      nombre: nombre, nombreLimpio: limpiarNombreAvanzado(nombre),
+      usada: false, id: index, monto: montoNum
+    });
+  });
+
+  // Inicializar Contadores y Listas
+  let kpi = { total: {c:0, m:0}, verde: {c:0, m:0}, azul: {c:0, m:0}, rojo: {c:0, m:0}, amarillo: {c:0, m:0}, naranja: {c:0, m:0} };
+  let statsVendedores = {}, statsDiferidos = {};
+  let reporte = [["Fecha Cierre", "Fecha Ejec.", "Vendedor", "Cliente HubSpot", "Nombre Usado", "Monto HubSpot", "Factura Match", "Estado", "Nota"]];
+  let listaCeros = [["Fecha", "Vendedor", "Cliente / Negocio", "Pipeline", "Nota"]];
+  let listaDiferidos = [["Fecha Cierre", "Fecha Ejec.", "Desfase", "Cliente", "Monto"]];
+  let pendientesDeAgrupar = []; 
+
+  // --- FASE 1: PROCESAMIENTO UNO A UNO ---
+  filasHubspot.forEach((fila) => {
+    let rawNombreNegocio = fila[colNombreNegocio] || "---";
+    let montoH = parseFloat(fila[colMonto]);
+    let fechaH = fila[colFechaCierre];
+    let fechaServ = (colFechaServicio > -1) ? fila[colFechaServicio] : null;
+    let vendedor = (colPropietario > -1) ? fila[colPropietario] : "Sin Asignar";
+    let pipeline = (colPipeline > -1) ? fila[colPipeline] : "General";
+
+    if (isNaN(montoH) && rawNombreNegocio === "---") return;
+    if ((montoH || 0) < 0.01) {
+       let fStr = (fechaH instanceof Date) ? Utilities.formatDate(fechaH, ss.getSpreadsheetTimeZone(), "dd/MM/yyyy") : String(fechaH).substring(0, 10);
+       listaCeros.push([fStr, vendedor, rawNombreNegocio, pipeline, "Monto 0"]);
+       return;
+    }
+
+    let razonSocial = (colRazonSocial > -1) ? fila[colRazonSocial] : "";
+    let associatedComp = (colAssociatedComp > -1) ? fila[colAssociatedComp] : "";
+    kpi.total.c++; kpi.total.m += montoH;
+
+    let montoHKey = (montoH || 0).toFixed(2);
+    let nombreCandidato = "";
+    if (razonSocial && razonSocial.trim() !== "") nombreCandidato = razonSocial;
+    else if (associatedComp && associatedComp.trim() !== "") nombreCandidato = associatedComp;
+    else nombreCandidato = extraerNombreReal(rawNombreNegocio);
+
+    let nombreLimpio = limpiarNombreAvanzado(nombreCandidato);
+    let esAlias = false;
+    if (mapaAlias[nombreLimpio]) { nombreLimpio = mapaAlias[nombreLimpio]; esAlias = true; }
+    else {
+      let rawLimpio = limpiarNombreAvanzado(rawNombreNegocio);
+      if (mapaAlias[rawLimpio]) { nombreLimpio = mapaAlias[rawLimpio]; esAlias = true; }
+    }
+
+    let fechaStr = (fechaH instanceof Date) ? Utilities.formatDate(fechaH, ss.getSpreadsheetTimeZone(), "dd/MM/yyyy") : String(fechaH).substring(0, 10);
+    let fechaServStr = (fechaServ && fechaServ instanceof Date) ? Utilities.formatDate(fechaServ, ss.getSpreadsheetTimeZone(), "dd/MM/yyyy") : (fechaServ ? String(fechaServ).substring(0, 10) : "-");
+    
+    // ANALISIS DIFERIDOS (ACCRUALS)
+    let esDiferido = false;
+    let etiquetaDiferido = "";
+    if (fechaH && fechaServ) {
+      let dCierre = new Date(fechaH);
+      let dServ = new Date(fechaServ);
+      if (!isNaN(dCierre.getTime()) && !isNaN(dServ.getTime())) {
+        let mesCierre = dCierre.getFullYear()*12 + dCierre.getMonth();
+        let mesServ = dServ.getFullYear()*12 + dServ.getMonth();
+        
+        if (mesCierre !== mesServ) {
+          esDiferido = true;
+          let mC = Utilities.formatDate(dCierre, ss.getSpreadsheetTimeZone(), "MMM");
+          let mS = Utilities.formatDate(dServ, ss.getSpreadsheetTimeZone(), "MMM");
+          etiquetaDiferido = `${mC} ➔ ${mS}`; 
+          
+          if (!statsDiferidos[etiquetaDiferido]) statsDiferidos[etiquetaDiferido] = 0;
+          statsDiferidos[etiquetaDiferido] += montoH;
+          listaDiferidos.push([fechaStr, fechaServStr, etiquetaDiferido, nombreCandidato, montoH]);
+        }
+      }
+    }
+
+    // ALGORITMO DE MATCHING
+    let match = null;
+    let estado = "🔴 PENDIENTE";
+    let nota = esDiferido ? ("🗓️ Dif: " + etiquetaDiferido) : "Facturar"; 
+    let tipoMatch = "ROJO"; 
+
+    if (bolsaFacturas[montoHKey]) {
+      let grupo = bolsaFacturas[montoHKey];
+      let disponibles = grupo.filter(f => !f.usada);
+      if (disponibles.length > 0) {
+        let mejorMatch = null; let mejorScore = 0;
+        disponibles.forEach(fac => {
+           let score = calcularScoreSimilitud(nombreLimpio, fac.nombreLimpio);
+           if (score > mejorScore) { mejorScore = score; mejorMatch = fac; }
+        });
+        if (esAlias) {
+             match = disponibles.find(f => f.nombreLimpio.includes(nombreLimpio) || nombreLimpio.includes(f.nombreLimpio));
+             if (match) { estado = "✅ ALIAS"; tipoMatch = "VERDE"; nota = "Por Alias"; }
+        } else if (mejorScore >= 45) { // UMBRAL FUZZY
+             match = mejorMatch;
+             estado = mejorScore === 100 ? "✅ EXACTO" : "🔵 PROBABLE";
+             tipoMatch = mejorScore === 100 ? "VERDE" : "AZUL";
+             nota = "Similitud: " + mejorScore.toFixed(0) + "%";
+        }
+      }
+    }
+
+    if (match) {
+      match.usada = true;
+      if (tipoMatch === "VERDE") { kpi.verde.c++; kpi.verde.m += montoH; }
+      else { kpi.azul.c++; kpi.azul.m += montoH; }
+      reporte.push([fechaStr, fechaServStr, vendedor, rawNombreNegocio, nombreCandidato, montoH, match.nombre, estado, nota]);
+    } else {
+      pendientesDeAgrupar.push({ indiceReporte: reporte.length, nombreLimpio: nombreLimpio, monto: montoH, montoOriginal: montoH });
+      kpi.rojo.c++; kpi.rojo.m += montoH;
+      if(!statsVendedores[vendedor]) statsVendedores[vendedor] = 0; statsVendedores[vendedor] += montoH;
+      reporte.push([fechaStr, fechaServStr, vendedor, rawNombreNegocio, nombreCandidato, montoH, "---", "🔴 NO FACTURADO", "Posible Agrupación..."]);
+    }
+  });
+
+  // --- FASE 2: AGRUPACIONES INTELIGENTES (N a 1) ---
+  // Intenta sumar varias ventas pequeñas para matchear con una factura grande
+  let gruposVentas = {};
+  pendientesDeAgrupar.forEach(item => {
+    if(!gruposVentas[item.nombreLimpio]) gruposVentas[item.nombreLimpio] = { items: [], total: 0 };
+    gruposVentas[item.nombreLimpio].items.push(item);
+    gruposVentas[item.nombreLimpio].total += item.monto;
+  });
+  
+  for (let nombreKey in gruposVentas) {
+    let grupo = gruposVentas[nombreKey];
+    if (grupo.total > 0 && grupo.items.length > 0) {
+      let totalKey = grupo.total.toFixed(2);
+      if (bolsaFacturas[totalKey]) {
+        let fac = bolsaFacturas[totalKey].find(f => !f.usada);
+        if(fac) {
+          let score = calcularScoreSimilitud(nombreKey, fac.nombreLimpio);
+          if(score < 30 && bolsaFacturas[totalKey].filter(x=>!x.usada).length > 1) fac = null; 
+        }
+        if (fac) {
+          fac.usada = true;
+          kpi.rojo.c -= grupo.items.length; kpi.rojo.m -= grupo.total;
+          kpi.verde.c += grupo.items.length; kpi.verde.m += grupo.total;
+          grupo.items.forEach(item => {
+             let linea = reporte[item.indiceReporte]; 
+             let vend = linea[2]; 
+             if(statsVendedores[vend]) statsVendedores[vend] -= item.monto; 
+             linea[6] = fac.nombre + " (Global)"; linea[7] = "📦 AGRUPADO V>F"; linea[8] = "Ventas sumadas";
+             item.procesado = true;
+          });
+        }
+      }
+    }
+  }
+
+  // --- FASE 3: SOBRANTES (Ingresos no registrados en CRM) ---
+  reporte.push(["---", "---", "---", "---", "---", "---", "---", "---", "---"]);
+  for (let key in bolsaFacturas) {
+    bolsaFacturas[key].forEach(f => {
+      if (!f.usada) {
+        kpi.amarillo.c++; kpi.amarillo.m += f.monto;
+        reporte.push(["---", "---", "---", "---", "NO REGISTRADO", 0, f.nombre, "⚠️ SOBRANTE", "Revisar"]);
+      }
+    });
+  }
+
+  // RENDER UI V17
+  dibujarDashboardUI_V17(hojaReporte, kpi, statsVendedores, statsDiferidos, reporte, listaCeros, listaDiferidos);
+  actualizarHistorial(ss, kpi);
+}
+
+// =========================================================
+// --- UI & ALGORITMOS AUXILIARES ---
+// =========================================================
+
+function dibujarDashboardUI_V17(sheet, kpi, vend, diferidos, datos, ceros, listaDiferidos) {
+  // Renderizado de Tarjetas KPI
+  let cards = [{ t: "VENTAS (>0)", v: kpi.total.m, c: kpi.total.c, col: "#4285F4" }, { t: "CONCILIADO",  v: kpi.verde.m, c: kpi.verde.c, col: "#34A853" }, { t: "POR VALIDAR", v: kpi.azul.m + kpi.naranja.m,  c: kpi.azul.c + kpi.naranja.c,  col: "#46bdc6" }, { t: "FALTANTE",    v: kpi.rojo.m,  c: kpi.rojo.c,  col: "#EA4335" }, { t: "DOCS EXTRA",  v: kpi.amarillo.m, c: kpi.amarillo.c, col: "#FBBC05" }];
+  let headers = cards.map(x => x.t); let montos = cards.map(x => x.v); let counts = cards.map(x => x.c + " Regs");
+  sheet.getRange("B2:F2").setValues([headers]); sheet.getRange("B3:F3").setValues([montos]); sheet.getRange("B4:F4").setValues([counts]);
+  
+  // Estilo Tarjetas
+  for(let i=0; i<5; i++) { 
+      let col = i+2; 
+      sheet.getRange(2,col).setBackground(cards[i].col).setFontColor("white").setFontWeight("bold").setHorizontalAlignment("center").setBorder(true,true,false,true,null,null,"black",SpreadsheetApp.BorderStyle.SOLID_MEDIUM); 
+      sheet.getRange(3,col).setBackground("white").setFontColor("#333").setFontWeight("bold").setFontSize(14).setNumberFormat("$#,##0.00").setHorizontalAlignment("center").setBorder(false,true,false,true,null,null,"black",SpreadsheetApp.BorderStyle.SOLID_MEDIUM); 
+      sheet.getRange(4,col).setBackground("white").setFontColor("#666").setFontStyle("italic").setFontSize(9).setHorizontalAlignment("center").setBorder(false,true,true,true,null,null,"black",SpreadsheetApp.BorderStyle.SOLID_MEDIUM); 
+  }
+  
+  // Renderizado Tablas Detalle
+  let rowStart = 6;
+  let h1 = renderMiniTable(sheet, "🏆 TOP FALTANTES", vend, 2, "#d9534f", rowStart, true);
+  let h2 = renderMiniTable(sheet, "🗓️ DIFERIDOS ($)", diferidos, 4, "#9b59b6", rowStart, true);
+  
+  let altura = Math.max(h1, h2, 2);
+  let filaActual = rowStart + altura + 3;
+
+  // TABLA DETALLE DIFERIDOS
+  if (listaDiferidos.length > 1) {
+    sheet.getRange(filaActual, 2, 1, 5).merge().setValue("🗓️ LISTADO DE DIFERIDOS (PLANNING)").setBackground("#e1bee7").setFontColor("#4a148c").setFontWeight("bold").setHorizontalAlignment("center");
+    sheet.getRange(filaActual+1, 2, listaDiferidos.length, 5).setValues(listaDiferidos).setBorder(true,true,true,true,true,true,"#ccc",SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(filaActual+1, 2, 1, 5).setFontWeight("bold").setBackground("#f3e5f5"); 
+    sheet.getRange(filaActual+2, 6, listaDiferidos.length-1, 1).setNumberFormat("$#,##0"); 
+    filaActual += listaDiferidos.length + 2;
+  }
+
+  // TABLA PRINCIPAL
+  let filaTabla = filaActual + 1;
+  sheet.getRange(filaTabla, 1, 1, 9).setValues(datos.slice(0,1)).setBackground("#333").setFontColor("white").setFontWeight("bold");
+  let cuerpo = datos.slice(1);
+  if(cuerpo.length > 0) {
+    let rng = sheet.getRange(filaTabla+1, 1, cuerpo.length, 9);
+    rng.setValues(cuerpo).setBorder(true,true,true,true,true,true,"#e0e0e0",SpreadsheetApp.BorderStyle.SOLID);
+    rng.setVerticalAlignment("middle").setFontSize(9).setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+    for(let i=0; i<cuerpo.length; i++){ if(cuerpo[i][7] === "🟠 SOLO MONTO") sheet.getRange(filaTabla+1+i, 1, 1, 9).setBackground("#fff3e0"); }
+  }
+  
+  sheet.setColumnWidth(1,80); sheet.setColumnWidth(2,80); sheet.setColumnWidth(3,110); sheet.setColumnWidth(4,180); sheet.setColumnWidth(7,180);
+}
+
+function renderMiniTable(sheet, title, dataObj, col, color, row, isMoney) {
+  let arr = Object.entries(dataObj).filter(([k,v])=>v>0).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  if(arr.length === 0) {
+     sheet.getRange(row, col, 1, 2).setValue(title).merge().setBackground(color).setFontColor("white").setFontWeight("bold").setHorizontalAlignment("center");
+     sheet.getRange(row+1, col, 1, 2).setValue("Sin datos").setBorder(true,true,true,true,true,true,"#ccc",SpreadsheetApp.BorderStyle.SOLID);
+     return 1;
+  }
+  sheet.getRange(row, col, 1, 2).setValue(title).merge().setBackground(color).setFontColor("white").setFontWeight("bold").setHorizontalAlignment("center");
+  sheet.getRange(row+1, col, arr.length, 2).setValues(arr).setBackground("white").setBorder(true,true,true,true,true,true,"#ccc",SpreadsheetApp.BorderStyle.SOLID);
+  if(isMoney) sheet.getRange(row+1, col+1, arr.length, 1).setNumberFormat("$#,##0");
+  return arr.length;
+}
+
+function actualizarHistorial(ss, kpi) {
+  let hojaHist = ss.getSheetByName("Historial_KPIs");
+  if (!hojaHist) {
+    hojaHist = ss.insertSheet("Historial_KPIs");
+    hojaHist.appendRow(["Fecha Ejecución", "💰 Total Ventas", "✅ Conciliado", "🔵 Por Validar", "🚨 Faltante (Rojo)", "⚠️ Docs Sobrantes"]);
+    hojaHist.getRange("A1:F1").setFontWeight("bold").setBackground("#34495e").setFontColor("white");
+    hojaHist.setFrozenRows(1);
+  }
+  let rowData = [new Date(), kpi.total.m, kpi.verde.m, kpi.azul.m + kpi.naranja.m, kpi.rojo.m, kpi.amarillo.m];
+  hojaHist.appendRow(rowData);
+  let lastRow = hojaHist.getLastRow();
+  hojaHist.getRange(lastRow, 1).setNumberFormat("dd/MM/yyyy HH:mm");
+  hojaHist.getRange(lastRow, 2, 1, 5).setNumberFormat("$#,##0.00");
+}
+
+// --- ALGORITMOS DE NORMALIZACIÓN Y SIMILITUD ---
+function limpiarNombreAvanzado(n) { 
+    if (!n) return ""; 
+    return n.toString().toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+            .replace(/[\.,-\/]/g, " ")
+            .replace(/\s+/g, " ")
+            .replace(/ s ?a ?s/g, "").replace(/ s ?a/g, "") // Eliminar S.A., S.A.S
+            .replace(/ c ?a/g, "").replace(/ ltda/g, "") // Eliminar C.A., Ltda
+            .replace(/rental/g, "").replace(/b2b/g, "").replace(/pago/g, "").replace(/extra/g, "") // Palabras ruido
+            .trim(); 
+}
+
+function calcularScoreSimilitud(s1, s2) { 
+    if (s1 === s2) return 100; 
+    if (s1.includes(s2) || s2.includes(s1)) return 100; 
+    
+    // Tokenización simple
+    let p1 = s1.split(" ").filter(w => w.length > 3); 
+    let p2 = s2.split(" ").filter(w => w.length > 3); 
+    
+    if (p1.length === 0 || p2.length === 0) return 0; 
+    
+    // Intersección
+    let c = 0; 
+    p1.forEach(x => { 
+        if (p2.some(y => y.includes(x) || x.includes(y))) c++; 
+    }); 
+    return (c / p1.length) * 100; 
+}
+
+function extraerNombreReal(txt) { 
+    if (!txt) return ""; 
+    let t = txt.toString(); 
+    if (t.includes("/")) { 
+        let p = t.split("/"); 
+        if (p.length >= 2) { 
+            let pos = p[1].trim(); 
+            if (!pos.match(/\d/) && pos.length > 2) return pos; // Devuelve la parte de texto
+            return p[0].trim(); 
+        }
+    } 
+    return t; 
+}
